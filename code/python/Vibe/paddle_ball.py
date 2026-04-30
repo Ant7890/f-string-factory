@@ -5,23 +5,56 @@ import time
 import sys
 import threading
 import os
+import io
+import struct
+import subprocess
 
-try:
-    import winsound as _winsound   # Windows only; None on other platforms
-except ImportError:
-    _winsound = None  # type: ignore[assignment]
-
-# ── Background music via Windows MCI ─────────────────────────────────────────
+# ── Audio backend (pygame → Windows MCI/winsound → macOS afplay → silent) ────
+#
+#  Install pygame for the best cross-platform experience:
+#      pip install pygame
+#
 _MUSIC_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            '2021-08-30_-_Boss_Time_-_www.FesliyanStudios.com.mp3')
 
+# ---- pygame (Windows / macOS / Linux) ----------------------------------------
+_pgm       = None   # pygame.mixer module  or None
+_pg_music  = None   # pygame.mixer.music   or None
+_pg_beeps: list = []
+
+def _gen_beep_sound(freq: int, ms: int = 55):
+    """Build a tiny square-wave WAV in memory and return a pygame Sound."""
+    rate = 44100
+    n    = int(rate * ms / 1000)
+    buf  = bytearray()
+    for i in range(n):
+        v = 10000 if math.sin(2 * math.pi * freq * i / rate) > 0 else -10000
+        buf += struct.pack('<hh', v, v)   # stereo 16-bit
+    wav = io.BytesIO()
+    import wave
+    with wave.open(wav, 'wb') as w:
+        w.setnchannels(2); w.setsampwidth(2); w.setframerate(rate)
+        w.writeframes(bytes(buf))
+    wav.seek(0)
+    return _pgm.Sound(file=wav)  # type: ignore[union-attr]
+
+try:
+    import pygame.mixer as _pgm  # type: ignore[no-redef]
+    _pgm.pre_init(frequency=44100, size=-16, channels=2, buffer=512)
+    _pgm.init()
+    _pg_music = _pgm.music
+    _pg_beeps = [_gen_beep_sound(f) for f in (440, 554, 659)]
+except Exception:
+    _pgm = None  # type: ignore[assignment]
+
+# ---- Windows MCI fallback (music only) ---------------------------------------
 _mci_fn = None
-if sys.platform == 'win32':
+if _pgm is None and sys.platform == 'win32':
     try:
         import ctypes as _ct
         _mci_fn = _ct.WinDLL('winmm').mciSendStringW
         _mci_fn.argtypes = [_ct.c_wchar_p, _ct.c_wchar_p, _ct.c_uint, _ct.c_void_p]
-        _mci_fn.restype = _ct.c_int
+        _mci_fn.restype  = _ct.c_int
     except Exception:
         pass
 
@@ -31,6 +64,15 @@ def _mci(cmd: str) -> None:
             _mci_fn(cmd, None, 0, None)
         except Exception:
             pass
+
+# ---- Windows winsound fallback (beeps only) ----------------------------------
+try:
+    import winsound as _winsound
+except ImportError:
+    _winsound = None  # type: ignore[assignment]
+
+# ---- macOS afplay fallback (music only, no beeps) ----------------------------
+_afplay_proc: 'subprocess.Popen | None' = None
 
 
 # ── Data classes ─────────────────────────────────────────────────────────────
@@ -647,14 +689,52 @@ class Game:
     def _music_start(self) -> None:
         if not self._music_enabled:
             return
-        _mci('close bgm')  # no-op if not open; prevents double-open on restart
-        _mci(f'open "{_MUSIC_FILE}" type mpegvideo alias bgm')
-        _mci('play bgm repeat')
+        if _pg_music is not None:
+            try:
+                _pg_music.load(_MUSIC_FILE)
+                _pg_music.play(-1)
+            except Exception:
+                pass
+        elif sys.platform == 'win32':
+            _mci('close bgm')
+            _mci(f'open "{_MUSIC_FILE}" type mpegvideo alias bgm')
+            _mci('play bgm repeat')
+        elif sys.platform == 'darwin':
+            self._afplay_start()
         self._apply_volume()
 
     def _music_stop(self) -> None:
-        _mci('stop bgm')
-        _mci('close bgm')
+        if _pg_music is not None:
+            try:
+                _pg_music.stop()
+            except Exception:
+                pass
+        elif sys.platform == 'win32':
+            _mci('stop bgm')
+            _mci('close bgm')
+        elif sys.platform == 'darwin':
+            self._afplay_stop()
+
+    def _afplay_start(self) -> None:
+        global _afplay_proc
+        self._afplay_stop()
+        try:
+            # afplay doesn't loop natively; wrap in a shell loop
+            _afplay_proc = subprocess.Popen(
+                ['bash', '-c', f'while true; do afplay "{_MUSIC_FILE}"; done'],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+
+    def _afplay_stop(self) -> None:
+        global _afplay_proc
+        if _afplay_proc is not None:
+            try:
+                _afplay_proc.terminate()
+            except Exception:
+                pass
+            _afplay_proc = None
 
     def _toggle_music(self) -> None:
         self._music_enabled = not self._music_enabled
@@ -670,8 +750,15 @@ class Game:
         self._show_vol_flash()
 
     def _apply_volume(self) -> None:
-        vol = 0 if self._muted else self._volume * 10   # MCI range 0-1000
-        _mci(f'setaudio bgm volume to {vol}')
+        vol = 0 if self._muted else self._volume
+        if _pg_music is not None:
+            try:
+                _pg_music.set_volume(vol / 100.0)
+            except Exception:
+                pass
+        elif sys.platform == 'win32':
+            _mci(f'setaudio bgm volume to {vol * 10}')
+        # afplay has no runtime volume API; nothing to do
 
     def _on_scroll(self, e) -> None:
         delta = 5 if e.delta > 0 else -5
@@ -688,11 +775,16 @@ class Game:
             self.canvas.itemconfig(self._vol_lbl, text=f'{icon}  {self._volume}%')
 
     def _play_beep(self) -> None:
-        if _winsound is None:
-            return
-        freq = self._BEEP_FREQS[self._beep_idx % len(self._BEEP_FREQS)]
+        idx = self._beep_idx % len(self._BEEP_FREQS)
         self._beep_idx += 1
-        threading.Thread(target=_winsound.Beep, args=(freq, 55), daemon=True).start()
+        if _pg_beeps:
+            try:
+                _pg_beeps[idx].play()
+            except Exception:
+                pass
+        elif _winsound is not None:
+            freq = self._BEEP_FREQS[idx]
+            threading.Thread(target=_winsound.Beep, args=(freq, 55), daemon=True).start()
 
     # ── Main loop ────────────────────────────────────────────────────────────
 
@@ -884,6 +976,17 @@ def main():
     Game(root)
     root.mainloop()
 
+    # ── Cleanup ──────────────────────────────────────────────────────────────
+    if _afplay_proc is not None:
+        try:
+            _afplay_proc.terminate()
+        except Exception:
+            pass
+    if _pgm is not None:
+        try:
+            _pgm.quit()
+        except Exception:
+            pass
     if sys.platform == 'win32':
         try:
             import ctypes
