@@ -25,10 +25,9 @@ The full arc of this session:
 ## Requirements
 
 - Python 3.11+
+- Tkinter
 - Windows (for beep sounds and MP3 playback via `winsound` / Windows MCI)
 - The MP3 file must be in the same folder as `paddle_ball.py`
-
-No `pip install` needed — everything uses the standard library.
 
 ---
 
